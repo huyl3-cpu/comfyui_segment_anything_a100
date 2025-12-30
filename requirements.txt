@@ -2,3 +2,4 @@ segment_anything
 timm
 addict
 yapf
+torch<2.9.0
