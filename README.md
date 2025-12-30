@@ -31,7 +31,6 @@ This project is a heavily optimized fork of the original ComfyUI Segment Anythin
 7.  **Precision Engineering:**
     - **SAM**: Runs in `BFloat16` (BF16) for maximum throughput on Tensor Cores.
     - **GroundingDino**: Optimized batch inference.
-    - **English Standard**: All logs, comments, and UI elements are standardized in English.
 
 ## 🛠️ Installation
 
