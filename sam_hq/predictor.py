@@ -3,63 +3,91 @@ import numpy as np
 import torch
 from segment_anything import SamPredictor
 from segment_anything.modeling import Sam
-
+import gc
 
 class SamPredictorHQ(SamPredictor):
-
     def __init__(
         self,
         sam_model: Sam,
         sam_is_hq: bool = False,
     ) -> None:
-        """
-        Uses SAM to calculate the image embedding for an image, and then
-        allow repeated, efficient mask prediction given prompts.
-
-        Arguments:
-          sam_model (Sam): The model to use for mask prediction.
-        """
         super().__init__(sam_model=sam_model)
         self.is_hq = sam_is_hq
-    
+        self.batch_features = None
+        self.batch_interm_features = None
 
     @torch.no_grad()
-    def set_torch_image(
+    def set_torch_image_batch(
         self,
-        transformed_image: torch.Tensor,
+        transformed_images: torch.Tensor,
         original_image_size: Tuple[int, ...],
+        chunk_size: int = 16 
     ) -> None:
         """
-        Calculates the image embeddings for the provided image, allowing
-        masks to be predicted with the 'predict' method. Expects the input
-        image to be already transformed to the format expected by the model.
-
-        Arguments:
-          transformed_image (torch.Tensor): The input image, with shape
-            1x3xHxW, which has been transformed with ResizeLongestSide.
-          original_image_size (tuple(int, int)): The size of the image
-            before transformation, in (H, W) format.
+        Phiên bản Final Robust: Tự động dọn dẹp tàn dư của video cũ trước khi chạy video mới.
         """
-        assert (
-            len(transformed_image.shape) == 4
-            and transformed_image.shape[1] == 3
-            and max(*transformed_image.shape[2:]) == self.model.image_encoder.img_size
-        ), f"set_torch_image input must be BCHW with long side {self.model.image_encoder.img_size}."
+        # [QUAN TRỌNG] Bước 1: Giải phóng bộ nhớ của lần chạy trước NGAY LẬP TỨC
         self.reset_image()
+        if self.batch_features is not None:
+            del self.batch_features
+            self.batch_features = None
+        if self.batch_interm_features is not None:
+            del self.batch_interm_features
+            self.batch_interm_features = None
+        
+        # Gọi Garbage Collector để chắc chắn Python đã buông bỏ tham chiếu
+        gc.collect()
+        # Chỉ gọi empty_cache 1 lần duy nhất ở đầu để lấy chỗ trống cho video mới
+        torch.cuda.empty_cache() 
 
+        # --- Bắt đầu quy trình xử lý mới ---
         self.original_size = original_image_size
-        self.input_size = tuple(transformed_image.shape[-2:])
-        input_image = self.model.preprocess(transformed_image)
-        if self.is_hq:
-            self.features, self.interm_features = self.model.image_encoder(input_image)
-        else:
-            self.features = self.model.image_encoder(input_image)
-        self.is_image_set = True
+        self.input_size = tuple(transformed_images.shape[-2:])
+        
+        device = self.model.device
+        total_images = transformed_images.shape[0]
+        
+        feature_list = []
+        interm_feature_list = []
+        
+        print(f"🚀 [Robust Batching] Bắt đầu xử lý {total_images} ảnh (Đã dọn dẹp VRAM cũ)...")
 
+        for i in range(0, total_images, chunk_size):
+            end_idx = min(i + chunk_size, total_images)
+            
+            # Nạp dữ liệu vào GPU (Non-blocking để tăng tốc)
+            batch_chunk = transformed_images[i:end_idx].to(device, non_blocking=True)
+            
+            if batch_chunk.max() < 2.0:
+                batch_chunk = batch_chunk * 255.0
+            
+            batch_chunk = self.model.preprocess(batch_chunk).to(dtype=torch.bfloat16)
+            
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                if self.is_hq:
+                    features, interm = self.model.image_encoder(batch_chunk)
+                    feature_list.append(features.cpu()) 
+                    interm_feature_list.append(interm.cpu())
+                else:
+                    features = self.model.image_encoder(batch_chunk)
+                    feature_list.append(features.cpu())
+
+            # Xóa chunk ngay sau khi dùng xong
+            del batch_chunk
+            # Lưu ý: Không gọi empty_cache() ở đây để giữ tốc độ cao trong vòng lặp
+        
+        # Gộp kết quả cuối cùng lên GPU
+        self.batch_features = torch.cat(feature_list, dim=0).to(device)
+        if self.is_hq:
+            self.batch_interm_features = torch.cat(interm_feature_list, dim=0).to(device)
+            
+        self.is_image_set = True
+        print(f"✅ [Robust Batching] Hoàn tất! VRAM được bảo toàn.")
 
     @torch.no_grad()
-    def predict_torch(
+    def predict_torch_at_index(
         self,
+        index: int,
         point_coords: Optional[torch.Tensor],
         point_labels: Optional[torch.Tensor],
         boxes: Optional[torch.Tensor] = None,
@@ -67,78 +95,45 @@ class SamPredictorHQ(SamPredictor):
         multimask_output: bool = True,
         return_logits: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Predict masks for the given input prompts, using the currently set image.
-        Input prompts are batched torch tensors and are expected to already be
-        transformed to the input frame using ResizeLongestSide.
-
-        Arguments:
-          point_coords (torch.Tensor or None): A BxNx2 array of point prompts to the
-            model. Each point is in (X,Y) in pixels.
-          point_labels (torch.Tensor or None): A BxN array of labels for the
-            point prompts. 1 indicates a foreground point and 0 indicates a
-            background point.
-          boxes (np.ndarray or None): A Bx4 array given a box prompt to the
-            model, in XYXY format.
-          mask_input (np.ndarray): A low resolution mask input to the model, typically
-            coming from a previous prediction iteration. Has form Bx1xHxW, where
-            for SAM, H=W=256. Masks returned by a previous iteration of the
-            predict method do not need further transformation.
-          multimask_output (bool): If true, the model will return three masks.
-            For ambiguous input prompts (such as a single click), this will often
-            produce better masks than a single prediction. If only a single
-            mask is needed, the model's predicted quality score can be used
-            to select the best mask. For non-ambiguous prompts, such as multiple
-            input prompts, multimask_output=False can give better results.
-          return_logits (bool): If true, returns un-thresholded masks logits
-            instead of a binary mask.
-
-        Returns:
-          (torch.Tensor): The output masks in BxCxHxW format, where C is the
-            number of masks, and (H, W) is the original image size.
-          (torch.Tensor): An array of shape BxC containing the model's
-            predictions for the quality of each mask.
-          (torch.Tensor): An array of shape BxCxHxW, where C is the number
-            of masks and H=W=256. These low res logits can be passed to
-            a subsequent iteration as mask input.
-        """
+        
         if not self.is_image_set:
-            raise RuntimeError("An image must be set with .set_image(...) before mask prediction.")
+            raise RuntimeError("Phải gọi set_torch_image_batch trước.")
+
+        curr_features = self.batch_features[index : index + 1]
+        curr_interm = self.batch_interm_features[index : index + 1] if self.is_hq and self.batch_interm_features is not None else None
 
         if point_coords is not None:
             points = (point_coords, point_labels)
         else:
             points = None
 
-        # Embed prompts
         sparse_embeddings, dense_embeddings = self.model.prompt_encoder(
             points=points,
             boxes=boxes,
             masks=mask_input,
         )
 
-        # Predict masks
-        if self.is_hq:
-            low_res_masks, iou_predictions = self.model.mask_decoder(
-                image_embeddings=self.features,
-                image_pe=self.model.prompt_encoder.get_dense_pe(),
-                sparse_prompt_embeddings=sparse_embeddings,
-                dense_prompt_embeddings=dense_embeddings,
-                multimask_output=multimask_output,
-                hq_token_only=False,
-                interm_embeddings=self.interm_features,
-            )
-        else:
-            low_res_masks, iou_predictions = self.model.mask_decoder(
-                image_embeddings=self.features,
-                image_pe=self.model.prompt_encoder.get_dense_pe(),
-                sparse_prompt_embeddings=sparse_embeddings,
-                dense_prompt_embeddings=dense_embeddings,
-                multimask_output=multimask_output,
-            )
-        # Upscale the masks to the original image resolution
-        masks = self.model.postprocess_masks(low_res_masks, self.input_size, self.original_size)
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+            if self.is_hq:
+                low_res_masks, iou_predictions = self.model.mask_decoder(
+                    image_embeddings=curr_features,
+                    image_pe=self.model.prompt_encoder.get_dense_pe(),
+                    sparse_prompt_embeddings=sparse_embeddings,
+                    dense_prompt_embeddings=dense_embeddings,
+                    multimask_output=multimask_output,
+                    hq_token_only=False,
+                    interm_embeddings=curr_interm,
+                )
+            else:
+                low_res_masks, iou_predictions = self.model.mask_decoder(
+                    image_embeddings=curr_features,
+                    image_pe=self.model.prompt_encoder.get_dense_pe(),
+                    sparse_prompt_embeddings=sparse_embeddings,
+                    dense_prompt_embeddings=dense_embeddings,
+                    multimask_output=multimask_output,
+                )
 
+        masks = self.model.postprocess_masks(low_res_masks, self.input_size, self.original_size)
         if not return_logits:
             masks = masks > self.model.mask_threshold
 
