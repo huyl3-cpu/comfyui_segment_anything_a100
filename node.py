@@ -190,7 +190,6 @@ class GroundingDinoSAMSegment:
                 "threshold": ("FLOAT", {"default": 0.3, "min": 0, "max": 1.0, "step": 0.01}),
                 "A100_Optim": ("BOOLEAN", {"default": True, "label_on": "Active", "label_off": "Off"}),
                 "VRAM_Lock_GB": ("INT", {"default": 0, "min": 0, "max": 80, "step": 1}),
-                # [CHANGE] Max Batch Size reduced from 2048 -> 128 for easier UI adjustment
                 "sam_batch_size": ("INT", {"default": 32, "min": 1, "max": 128, "step": 1, "display": "slider"}),
             }
         }
@@ -235,13 +234,12 @@ class GroundingDinoSAMSegment:
         
         res_images, res_masks = [], []
         
-        # SAM post-processing (Keep as is since it is lightweight)
+        H, W = image.shape[1], image.shape[2] 
+        
         for i in range(image.shape[0]):
             boxes = boxes_batch[i]
             if boxes.shape[0] == 0: continue
             
-            img_np = (255. * image[i].cpu().numpy()).clip(0, 255).astype(np.uint8)
-            H, W, _ = img_np.shape
             boxes = boxes * torch.Tensor([W, H, W, H])
             boxes[:, :2] -= boxes[:, 2:] / 2
             boxes[:, 2:] += boxes[:, :2]
@@ -249,6 +247,7 @@ class GroundingDinoSAMSegment:
             
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 if hasattr(predictor, 'predict_torch_at_index'):
+                    # Output is already on GPU
                     masks, _, _ = predictor.predict_torch_at_index(
                         i,
                         point_coords=None, point_labels=None,
@@ -256,34 +255,38 @@ class GroundingDinoSAMSegment:
                         multimask_output=False
                     )
                 else:
-                    predictor.set_image(img_np)
                     masks, _, _ = predictor.predict_torch(
                         point_coords=None, point_labels=None,
                         boxes=transformed_boxes.to(device),
                         multimask_output=False
                     )
             
-            m_np = masks.cpu().numpy() 
-            for m_idx in range(m_np.shape[0]):
-                mask_slice = m_np[m_idx, 0, :, :]
-                res_masks.append(torch.from_numpy(mask_slice)[None,])
-                res_images.append(image[i][None,])
+            # [FIX MULTIPLE OBJECTS PER FRAME]
+            # If 1 frame has 3 masks, we must repeat that image frame 3 times
+            n_objects = masks.shape[0]
+            
+            # Keep everything on GPU
+            res_masks.append(masks)
+            
+            # Expand Image: (H,W,3) -> (1,H,W,3) -> (n_objects, H,W,3)
+            repeated_image = image[i].to(device).unsqueeze(0).repeat(n_objects, 1, 1, 1)
+            res_images.append(repeated_image)
 
         if not res_images: return (torch.zeros((1, 64, 64, 3)), torch.zeros((1, 64, 64)))
         
-        final_images = torch.cat(res_images, dim=0)
-        final_masks = torch.cat(res_masks, dim=0)
+        # Concatenate tensors directly on GPU
+        final_images = torch.cat(res_images, dim=0) # Shape: (Total_Masks, H, W, 3)
+        final_masks = torch.cat(res_masks, dim=0)   # Shape: (Total_Masks, 1, H, W)
 
-        # Expand mask dimensions from (Batch, H, W) to (Batch, H, W, 1) for multiplication with color image
-        if final_masks.dim() == 3:
-            mask_for_mul = final_masks.unsqueeze(-1)
-        else:
-            mask_for_mul = final_masks
+        # Permute mask to match image channels for multiplication
+        # From (Batch, 1, H, W) -> (Batch, H, W, 1)
+        mask_for_mul = final_masks.permute(0, 2, 3, 1)
         
-        # Multiply original image with mask to remove background (Keep object on black background)
+        # Multiply (Now Broadcasts correctly)
         masked_images = final_images * mask_for_mul
 
-        return (masked_images, final_masks)
+        # Return: Image (B,H,W,3) and Mask (B,H,W) -> Squeeze channel dim for ComfyUI
+        return (masked_images, final_masks.squeeze(1))
 
 class InvertMask:
     @classmethod
