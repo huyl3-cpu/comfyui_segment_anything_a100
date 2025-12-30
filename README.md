@@ -47,7 +47,7 @@ This project is a heavily optimized fork of the original ComfyUI Segment Anythin
 
     > **Note:** My test with:
     > ```bash
-    > pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url [https://download.pytorch.org/whl/cu128](https://download.pytorch.org/whl/cu128)
+    > pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128
     > ```
     > on Google Colab A100.
 
