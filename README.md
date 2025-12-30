@@ -37,7 +37,7 @@ This project is a heavily optimized fork of the original ComfyUI Segment Anythin
 1. Clone this repository into your `ComfyUI/custom_nodes/` folder:
     ```bash
     cd ComfyUI/custom_nodes/
-    git clone [https://github.com/your-repo/ComfyUI-Segment-Anything-A100.git](https://github.com/your-repo/ComfyUI-Segment-Anything-A100.git)
+    git clone https://github.com/huyl3-cpu/comfyui_segment_anything_a100.git
     ```
 
 2. Install dependencies:
