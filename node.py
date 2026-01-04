@@ -1,57 +1,84 @@
 import os
 import sys
-
-# Register submodule path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-import copy
 import torch
 import torch.nn.functional as F
 import numpy as np
 from PIL import Image
 import logging
-import warnings
-import gc
 from torch.hub import download_url_to_file
 from urllib.parse import urlparse
-import glob
-
-# Import internal modules
 import folder_paths
 import comfy.model_management
+from typing import List, Optional
+
+# Import từ thư mục con
 from sam_hq.predictor import SamPredictorHQ
 from sam_hq.build_sam_hq import sam_model_registry
+
+# Import GroundingDINO dependencies
 from local_groundingdino.datasets import transforms as T
 from local_groundingdino.util.utils import clean_state_dict as local_groundingdino_clean_state_dict
 from local_groundingdino.util.slconfig import SLConfig as local_groundingdino_SLConfig
 from local_groundingdino.models import build_model as local_groundingdino_build_model
+import glob
 
-# --- HOT PATCH SYSTEM ---
-_ORIGINAL_MESHGRID = torch.meshgrid
-_ORIGINAL_CHECKPOINT = torch.utils.checkpoint.checkpoint
+logger = logging.getLogger('comfyui_segment_anything_a100')
 
-def perform_system_patch():
-    try:
-        def patched_meshgrid(*tensors, **kwargs):
-            if 'indexing' not in kwargs: kwargs['indexing'] = 'ij'
-            return _ORIGINAL_MESHGRID(*tensors, **kwargs)
-        torch.meshgrid = patched_meshgrid
-        torch.functional.meshgrid = patched_meshgrid
-        torch.nn.functional.meshgrid = patched_meshgrid
+# --- POLYFILL: Class xử lý Batch (Đã thêm thuộc tính .device) ---
+class FastNestedTensor:
+    def __init__(self, tensors, mask: Optional[torch.Tensor]):
+        self.tensors = tensors
+        self.mask = mask
 
-        def patched_checkpoint(function, *args, **kwargs):
-            if 'use_reentrant' not in kwargs: kwargs['use_reentrant'] = False
-            return _ORIGINAL_CHECKPOINT(function, *args, **kwargs)
-        torch.utils.checkpoint.checkpoint = patched_checkpoint
-        return True
-    except Exception: return False
+    def to(self, device):
+        cast_tensor = self.tensors.to(device)
+        mask = self.mask
+        if mask is not None:
+            cast_mask = mask.to(device)
+        else:
+            cast_mask = None
+        return FastNestedTensor(cast_tensor, cast_mask)
 
-perform_system_patch()
+    def decompose(self):
+        return self.tensors, self.mask
 
-# --- CONFIGURATION ---
-logger = logging.getLogger('comfyui_segment_anything')
-warnings.filterwarnings("ignore")
+    @property
+    def device(self):
+        return self.tensors.device
 
+    @property
+    def shape(self):
+        return self.tensors.shape
+
+def nested_tensor_from_tensor_list(tensor_list: List[torch.Tensor]):
+    """
+    Gom nhiều ảnh thành 1 Batch Tensor có Padding (thay thế hàm thư viện thiếu).
+    """
+    if tensor_list[0].ndim == 3:
+        max_size = [0, 0, 0]
+        for img in tensor_list:
+            for i, s in enumerate(img.shape):
+                max_size[i] = max(max_size[i], s)
+        
+        batch_shape = [len(tensor_list)] + max_size
+        b, c, h, w = batch_shape
+        dtype = tensor_list[0].dtype
+        device = tensor_list[0].device
+        
+        tensor = torch.zeros(batch_shape, dtype=dtype, device=device)
+        mask = torch.ones((b, h, w), dtype=torch.bool, device=device)
+        
+        for img, pad_img, m in zip(tensor_list, tensor, mask):
+            pad_img[: img.shape[0], : img.shape[1], : img.shape[2]].copy_(img)
+            m[: img.shape[1], : img.shape[2]] = False
+            
+        return FastNestedTensor(tensor, mask)
+    else:
+        raise ValueError("Tensor input must be 3D (C, H, W)")
+
+# --- CONFIG ---
 sam_model_dir_name = "sams"
 sam_model_list = {
     "sam_vit_h (2.56GB)": {"model_url": "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth"},
@@ -75,110 +102,133 @@ groundingdino_model_list = {
     },
 }
 
-# --- HELPER ---
+def get_bert_base_uncased_model_path():
+    comfy_bert_model_base = os.path.join(folder_paths.models_dir, 'bert-base-uncased')
+    if glob.glob(os.path.join(comfy_bert_model_base, '**/model.safetensors'), recursive=True):
+        return comfy_bert_model_base
+    return 'bert-base-uncased'
+
+def list_sam_model(): return list(sam_model_list.keys())
+def list_groundingdino_model(): return list(groundingdino_model_list.keys())
+
 def get_local_filepath(url, dirname, local_file_name=None):
-    if not local_file_name: local_file_name = os.path.basename(urlparse(url).path)
+    if not local_file_name:
+        parsed_url = urlparse(url)
+        local_file_name = os.path.basename(parsed_url.path)
     destination = folder_paths.get_full_path(dirname, local_file_name)
     if destination: return destination
     folder = os.path.join(folder_paths.models_dir, dirname)
-    os.makedirs(folder, exist_ok=True)
+    if not os.path.exists(folder): os.makedirs(folder)
     destination = os.path.join(folder, local_file_name)
-    if not os.path.exists(destination): download_url_to_file(url, destination)
+    if not os.path.exists(destination):
+        download_url_to_file(url, destination)
     return destination
 
 def load_sam_model(model_name):
-    path = get_local_filepath(sam_model_list[model_name]["model_url"], sam_model_dir_name)
-    model_type = os.path.basename(path).split('.')[0]
-    if 'hq' not in model_type and 'mobile' not in model_type: model_type = '_'.join(model_type.split('_')[:-1])
-    sam = sam_model_registry[model_type](checkpoint=path)
-    device = comfy.model_management.get_torch_device()
-    sam.to(device=device, dtype=torch.bfloat16) 
+    sam_checkpoint_path = get_local_filepath(sam_model_list[model_name]["model_url"], sam_model_dir_name)
+    model_file_name = os.path.basename(sam_checkpoint_path)
+    model_type = model_file_name.split('.')[0]
+    if 'hq' not in model_type and 'mobile' not in model_type:
+        model_type = '_'.join(model_type.split('_')[:-1])
+    sam = sam_model_registry[model_type](checkpoint=sam_checkpoint_path)
+    sam.to(device=comfy.model_management.get_torch_device())
     sam.eval()
-    sam.model_name = os.path.basename(path)
+    sam.model_name = model_file_name
     return sam
 
 def load_groundingdino_model(model_name):
-    cfg_path = get_local_filepath(groundingdino_model_list[model_name]["config_url"], groundingdino_model_dir_name)
-    comfy_bert_model_base = os.path.join(folder_paths.models_dir, 'bert-base-uncased')
-    if not glob.glob(os.path.join(comfy_bert_model_base, '**/model.safetensors'), recursive=True):
-        comfy_bert_model_base = 'bert-base-uncased'
-    dino_args = local_groundingdino_SLConfig.fromfile(cfg_path)
-    if dino_args.text_encoder_type == 'bert-base-uncased': dino_args.text_encoder_type = comfy_bert_model_base
-    dino_args.device = comfy.model_management.get_torch_device()
-    dino = local_groundingdino_build_model(dino_args)
-    ckpt = torch.load(get_local_filepath(groundingdino_model_list[model_name]["model_url"], groundingdino_model_dir_name), map_location="cpu")
-    dino.load_state_dict(local_groundingdino_clean_state_dict(ckpt['model']), strict=False)
-    dino.to(device=dino_args.device)
+    dino_model_args = local_groundingdino_SLConfig.fromfile(
+        get_local_filepath(groundingdino_model_list[model_name]["config_url"], groundingdino_model_dir_name)
+    )
+    if dino_model_args.text_encoder_type == 'bert-base-uncased':
+        dino_model_args.text_encoder_type = get_bert_base_uncased_model_path()
+    dino = local_groundingdino_build_model(dino_model_args)
+    checkpoint = torch.load(get_local_filepath(groundingdino_model_list[model_name]["model_url"], groundingdino_model_dir_name))
+    dino.load_state_dict(local_groundingdino_clean_state_dict(checkpoint['model']), strict=False)
+    dino.to(device=comfy.model_management.get_torch_device())
     dino.eval()
     return dino
 
-# [ULTIMATE OPTIMIZATION] Streaming Pipeline: CPU -> GPU (Chunk) -> Clear
-def batch_dino_predict(dino_model, image_tensor, prompt, threshold, batch_size):
+# --- OPTIMIZED BATCH FUNCTIONS ---
+
+def groundingdino_predict_batch(dino_model, image_pil_list, prompt, threshold):
+    # 1. Prepare Transforms
+    transform = T.Compose([
+        T.RandomResize([800], max_size=1333),
+        T.ToTensor(),
+        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+    
+    # 2. Transform all images
+    tensors_list = []
+    for img in image_pil_list:
+        t_img, _ = transform(img, None)
+        tensors_list.append(t_img)
+    
+    # 3. Create NestedTensor (Batch container for DINO)
     device = comfy.model_management.get_torch_device()
+    samples = nested_tensor_from_tensor_list(tensors_list).to(device)
     
-    prompt = prompt.lower().strip()
-    if not prompt.endswith("."): prompt += "."
+    # 4. Prepare Captions
+    caption = prompt.lower().strip()
+    if not caption.endswith("."): caption = caption + "."
+    captions_batch = [caption] * len(image_pil_list)
     
-    all_boxes = []
-    total_images = image_tensor.shape[0]
+    # 5. Run Inference
+    with torch.no_grad():
+        outputs = dino_model(samples, captions=captions_batch)
+    
+    # 6. Process Outputs
+    prediction_logits = outputs["pred_logits"].sigmoid()
+    prediction_boxes = outputs["pred_boxes"]
+    
+    batch_boxes_result = []
+    
+    for i in range(len(image_pil_list)):
+        logits = prediction_logits[i]
+        boxes = prediction_boxes[i]
+        
+        mask = logits.max(dim=1)[0] > threshold
+        boxes_filt = boxes[mask].cpu()
+        
+        H, W = image_pil_list[i].size[1], image_pil_list[i].size[0]
+        for j in range(boxes_filt.size(0)):
+            boxes_filt[j] = boxes_filt[j] * torch.Tensor([W, H, W, H])
+            boxes_filt[j][:2] -= boxes_filt[j][2:] / 2
+            boxes_filt[j][2:] += boxes_filt[j][:2]
+            
+        batch_boxes_result.append(boxes_filt)
+        
+    return batch_boxes_result
 
-    # Prepare Mean/Std on GPU once for reuse
-    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+def prepare_sam_batch(images_tensor, target_length=1024):
+    B, H, W, C = images_tensor.shape
+    device = comfy.model_management.get_torch_device()
+    scale = target_length * 1.0 / max(H, W)
+    new_h, new_w = int(H * scale + 0.5), int(W * scale + 0.5)
+    
+    img = images_tensor.permute(0, 3, 1, 2).to(device)
+    img = F.interpolate(img, size=(new_h, new_w), mode="bilinear", align_corners=False)
+    img = img * 255.0 
+    return img
 
-    # Main loop: Process only small batches
-    for start_idx in range(0, total_images, batch_size):
-        end_idx = min(start_idx + batch_size, total_images)
-        
-        # 1. Only transfer the necessary amount of images from CPU to GPU
-        # image_tensor is on CPU (or external device), slice first then .to(device)
-        batch_imgs = image_tensor[start_idx:end_idx].permute(0, 3, 1, 2).to(device)
-        
-        # 2. Resize & Normalize directly on this small batch
-        in_h, in_w = batch_imgs.shape[2], batch_imgs.shape[3]
-        scale = min(800 / min(in_h, in_w), 1333 / max(in_h, in_w))
-        new_h, new_w = int(in_h * scale), int(in_w * scale)
-        
-        batch_imgs = F.interpolate(batch_imgs, size=(new_h, new_w), mode='bilinear', align_corners=False)
-        batch_imgs = (batch_imgs - mean) / std
-        
-        batch_captions = [prompt] * (end_idx - start_idx)
-        
-        # 3. Inference
-        with torch.no_grad():
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                outputs = dino_model(batch_imgs, captions=batch_captions)
-        
-        batch_logits = outputs["pred_logits"].sigmoid()
-        batch_boxes = outputs["pred_boxes"]
-        
-        # 4. Filter and push results immediately to CPU
-        for i in range(batch_logits.shape[0]):
-            logits = batch_logits[i]
-            boxes = batch_boxes[i]
-            mask = logits.max(dim=1)[0] > threshold
-            all_boxes.append(boxes[mask].cpu())
-
-        # 5. Clean up VRAM immediately after each batch
-        del batch_imgs, outputs, batch_logits, batch_boxes
-        # torch.cuda.empty_cache() # Can be enabled if VRAM is too low, but will slow down FPS
-
-    return all_boxes
-
-# --- NODE DEFINITIONS ---
-class SAMModelLoader:
+class SAMModelLoader_A100:
     @classmethod
-    def INPUT_TYPES(cls): return {"required": {"model_name": (list(sam_model_list.keys()), )}}
-    CATEGORY = "segment_anything"; FUNCTION = "main"; RETURN_TYPES = ("SAM_MODEL", )
+    def INPUT_TYPES(cls): return {"required": {"model_name": (list_sam_model(), )}}
+    CATEGORY = "segment_anything"
+    FUNCTION = "main"
+    RETURN_TYPES = ("SAM_MODEL", )
     def main(self, model_name): return (load_sam_model(model_name), )
 
-class GroundingDinoModelLoader:
+class GroundingDinoModelLoader_A100:
     @classmethod
-    def INPUT_TYPES(cls): return {"required": {"model_name": (list(groundingdino_model_list.keys()), )}}
-    CATEGORY = "segment_anything"; FUNCTION = "main"; RETURN_TYPES = ("GROUNDING_DINO_MODEL", )
+    def INPUT_TYPES(cls): return {"required": {"model_name": (list_groundingdino_model(), )}}
+    CATEGORY = "segment_anything"
+    FUNCTION = "main"
+    RETURN_TYPES = ("GROUNDING_DINO_MODEL", )
     def main(self, model_name): return (load_groundingdino_model(model_name), )
 
-class GroundingDinoSAMSegment:
+class GroundingDinoSAMSegment_A100:
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -186,117 +236,102 @@ class GroundingDinoSAMSegment:
                 "sam_model": ('SAM_MODEL', {}),
                 "grounding_dino_model": ('GROUNDING_DINO_MODEL', {}),
                 "image": ('IMAGE', {}),
-                "prompt": ("STRING", {"multiline": True}),
+                "prompt": ("STRING", {}),
                 "threshold": ("FLOAT", {"default": 0.3, "min": 0, "max": 1.0, "step": 0.01}),
-                "A100_Optim": ("BOOLEAN", {"default": True, "label_on": "Active", "label_off": "Off"}),
-                "VRAM_Lock_GB": ("INT", {"default": 0, "min": 0, "max": 80, "step": 1}),
-                "sam_batch_size": ("INT", {"default": 32, "min": 1, "max": 128, "step": 1, "display": "slider"}),
+                "batch_size": ("INT", {"default": 8, "min": 1, "max": 64, "step": 1}),
             }
         }
     CATEGORY = "segment_anything"
     FUNCTION = "main"
     RETURN_TYPES = ("IMAGE", "MASK")
-
-    def main(self, grounding_dino_model, sam_model, image, prompt, threshold, A100_Optim, VRAM_Lock_GB, sam_batch_size):
-        if A100_Optim and torch.cuda.is_available():
-            if VRAM_Lock_GB > 0:
-                total_vram = torch.cuda.get_device_properties(0).total_memory
-                fraction = (VRAM_Lock_GB * 1024**3) / total_vram
-                torch.cuda.set_per_process_memory_fraction(min(fraction, 1.0))
-                print(f"🔒 [A100 System] VRAM Capped at {VRAM_Lock_GB}GB")
-            else:
-                torch.cuda.set_per_process_memory_fraction(1.0)
-                print(f"🔓 [A100 System] VRAM Unlocked (Full Power)")
-
-            torch.backends.cudnn.benchmark = True
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-            
-            gc.collect()
-            torch.cuda.empty_cache()
-
+    
+    def main(self, grounding_dino_model, sam_model, image, prompt, threshold, batch_size):
+        total_images = image.shape[0]
         device = comfy.model_management.get_torch_device()
-        sam_is_hq = 'hq' in getattr(sam_model, 'model_name', '').lower()
+        
+        sam_is_hq = False
+        if hasattr(sam_model, 'model_name') and 'hq' in sam_model.model_name: sam_is_hq = True
         predictor = SamPredictorHQ(sam_model, sam_is_hq)
-        
-        print(f"🚀 Running GroundingDINO Inference (Stream Batch: {sam_batch_size})...")
-        # Call the new optimized function
-        boxes_batch = batch_dino_predict(grounding_dino_model, image, prompt, threshold, sam_batch_size)
-        
-        # Prepare input for SAM (keep CPU->GPU logic for SAM unchanged)
-        sam_input = image.permute(0, 3, 1, 2) 
-        
-        if hasattr(predictor, 'set_torch_image_batch'):
-            print(f"🚀 Running SAM Inference (Chunk Size: {sam_batch_size})...")
-            predictor.set_torch_image_batch(sam_input, (image.shape[1], image.shape[2]), chunk_size=sam_batch_size)
-        else:
-            print("⚠️ Warning: Please update predictor.py immediately!")
         
         res_images, res_masks = [], []
         
-        H, W = image.shape[1], image.shape[2] 
-        
-        for i in range(image.shape[0]):
-            boxes = boxes_batch[i]
-            if boxes.shape[0] == 0: continue
+        # --- BATCH PROCESSING ---
+        for i in range(0, total_images, batch_size):
+            end_idx = min(i + batch_size, total_images)
+            chunk_images = image[i:end_idx]
             
-            boxes = boxes * torch.Tensor([W, H, W, H])
-            boxes[:, :2] -= boxes[:, 2:] / 2
-            boxes[:, 2:] += boxes[:, :2]
-            transformed_boxes = predictor.transform.apply_boxes_torch(boxes, (H, W))
+            # 1. ENCODER (Batch)
+            sam_input_batch = prepare_sam_batch(chunk_images)
+            batch_features, batch_interm = predictor.get_image_features(sam_input_batch)
             
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                if hasattr(predictor, 'predict_torch_at_index'):
-                    # Output is already on GPU
-                    masks, _, _ = predictor.predict_torch_at_index(
-                        i,
-                        point_coords=None, point_labels=None,
-                        boxes=transformed_boxes.to(device),
-                        multimask_output=False
-                    )
-                else:
-                    masks, _, _ = predictor.predict_torch(
-                        point_coords=None, point_labels=None,
-                        boxes=transformed_boxes.to(device),
-                        multimask_output=False
-                    )
+            original_size = (chunk_images.shape[1], chunk_images.shape[2])
+            input_size = (sam_input_batch.shape[2], sam_input_batch.shape[3])
             
-            # [FIX MULTIPLE OBJECTS PER FRAME]
-            # If 1 frame has 3 masks, we must repeat that image frame 3 times
-            n_objects = masks.shape[0]
+            # 2. GROUNDING DINO (Batch)
+            chunk_pil_list = []
+            for j in range(chunk_images.shape[0]):
+                chunk_pil_list.append(
+                    Image.fromarray(np.clip(255. * chunk_images[j].cpu().numpy(), 0, 255).astype(np.uint8)).convert('RGB')
+                )
+            batch_boxes = groundingdino_predict_batch(grounding_dino_model, chunk_pil_list, prompt, threshold)
             
-            # Keep everything on GPU
-            res_masks.append(masks)
-            
-            # Expand Image: (H,W,3) -> (1,H,W,3) -> (n_objects, H,W,3)
-            repeated_image = image[i].to(device).unsqueeze(0).repeat(n_objects, 1, 1, 1)
-            res_images.append(repeated_image)
+            # 3. DECODER (Feature Injection)
+            for idx_in_batch in range(chunk_images.shape[0]):
+                curr_image_tensor = chunk_images[idx_in_batch]
+                boxes = batch_boxes[idx_in_batch]
+                
+                if boxes.shape[0] == 0:
+                    empty_mask = torch.zeros((1, original_size[0], original_size[1]), dtype=torch.float32, device="cpu")
+                    res_masks.append(empty_mask)
+                    res_images.append(curr_image_tensor.unsqueeze(0))
+                    continue
 
-        if not res_images: return (torch.zeros((1, 64, 64, 3)), torch.zeros((1, 64, 64)))
-        
-        # Concatenate tensors directly on GPU
-        final_images = torch.cat(res_images, dim=0) # Shape: (Total_Masks, H, W, 3)
-        final_masks = torch.cat(res_masks, dim=0)   # Shape: (Total_Masks, 1, H, W)
+                # Slice Features
+                curr_feat = batch_features[idx_in_batch].unsqueeze(0)
+                curr_interm = None
+                if sam_is_hq and batch_interm is not None:
+                     curr_interm = [f[idx_in_batch].unsqueeze(0) for f in batch_interm]
 
-        # Permute mask to match image channels for multiplication
-        # From (Batch, 1, H, W) -> (Batch, H, W, 1)
-        mask_for_mul = final_masks.permute(0, 2, 3, 1)
-        
-        # Multiply (Now Broadcasts correctly)
-        masked_images = final_images * mask_for_mul
+                # Inject Features
+                predictor.set_precomputed_features(curr_feat, curr_interm, original_size, input_size)
+                
+                # Transform Boxes
+                transformed_boxes = predictor.transform.apply_boxes_torch(boxes, original_size)
+                transformed_boxes = transformed_boxes.to(device)
+                
+                # Predict
+                masks, _, _ = predictor.predict_torch(
+                    point_coords=None,
+                    point_labels=None,
+                    boxes=transformed_boxes,
+                    multimask_output=False
+                )
+                
+                final_mask = torch.any(masks, dim=0).float().cpu()
+                res_masks.append(final_mask)
+                
+                masked_image = curr_image_tensor.clone()
+                masked_image[final_mask[0].unsqueeze(-1).repeat(1, 1, 3) == 0] = 0
+                res_images.append(masked_image.unsqueeze(0))
 
-        # Return: Image (B,H,W,3) and Mask (B,H,W) -> Squeeze channel dim for ComfyUI
-        return (masked_images, final_masks.squeeze(1))
+        if len(res_images) == 0:
+            return (torch.zeros_like(image), torch.zeros((total_images, image.shape[1], image.shape[2])))
+            
+        return (torch.cat(res_images, dim=0), torch.cat(res_masks, dim=0))
 
 class InvertMask:
     @classmethod
     def INPUT_TYPES(cls): return {"required": {"mask": ("MASK",)}}
-    CATEGORY = "segment_anything"; FUNCTION = "main"; RETURN_TYPES = ("MASK",)
+    CATEGORY = "segment_anything"
+    FUNCTION = "main"
+    RETURN_TYPES = ("MASK",)
     def main(self, mask): return (1.0 - mask,)
 
 class IsMaskEmptyNode:
     @classmethod
     def INPUT_TYPES(s): return {"required": {"mask": ("MASK",)}}
-    RETURN_TYPES = ["NUMBER"]; RETURN_NAMES = ["boolean_number"]
-    FUNCTION = "main"; CATEGORY = "segment_anything"
+    RETURN_TYPES = ["NUMBER"]
+    RETURN_NAMES = ["boolean_number"]
+    FUNCTION = "main"
+    CATEGORY = "segment_anything"
     def main(self, mask): return (torch.all(mask == 0).int().item(), )
